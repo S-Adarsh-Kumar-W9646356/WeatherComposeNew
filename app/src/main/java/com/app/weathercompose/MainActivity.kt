@@ -2,10 +2,16 @@ package com.app.weathercompose
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.app.AlertDialog
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.location.Geocoder
 import android.location.Location
+import android.location.LocationManager
 import android.os.Bundle
+import android.provider.Settings
 import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -14,7 +20,9 @@ import androidx.compose.animation.ExperimentalAnimationApi
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.ui.platform.LocalContext
 import androidx.navigation.NavType
@@ -31,7 +39,9 @@ import com.google.accompanist.permissions.ExperimentalPermissionsApi
 import com.google.accompanist.permissions.isGranted
 import com.google.accompanist.permissions.rememberPermissionState
 import com.google.android.gms.location.FusedLocationProviderClient
+import com.google.android.gms.location.LocationRequest
 import com.google.android.gms.location.LocationServices
+import com.google.android.gms.location.Priority
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -86,24 +96,45 @@ fun Navigation(mainViewModel: MainViewModel) {
     }
 }
 
+
 @OptIn(ExperimentalPermissionsApi::class)
 @Composable
 fun RequestLocationPermission(mainViewModel: MainViewModel) {
     val locationPermissionState = rememberPermissionState(Manifest.permission.ACCESS_FINE_LOCATION)
     val context = LocalContext.current
     val fusedLocationClient = remember { LocationServices.getFusedLocationProviderClient(context) }
+    val locationManager = context.getSystemService(Context.LOCATION_SERVICE) as LocationManager
 
-    LaunchedEffect(locationPermissionState.status.isGranted) {
+    val isGpsEnabled = remember { mutableStateOf(locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)) }
+
+    DisposableEffect(context) {
+        val gpsStatusReceiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                isGpsEnabled.value = locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)
+            }
+        }
+        val intentFilter = IntentFilter(LocationManager.PROVIDERS_CHANGED_ACTION)
+        context.registerReceiver(gpsStatusReceiver, intentFilter)
+
+        onDispose {
+            context.unregisterReceiver(gpsStatusReceiver)
+        }
+    }
+
+    LaunchedEffect(locationPermissionState.status.isGranted, isGpsEnabled.value) {
         if (locationPermissionState.status.isGranted) {
-            getLocation(fusedLocationClient, context) { location ->
-                mainViewModel.updateLocation(location)
+            if (!isGpsEnabled.value) {
+                showEnableGPSDialog(context)
+            } else {
+                getLocation(fusedLocationClient, context) { location ->
+                    mainViewModel.updateLocation(location)
+                }
             }
         } else {
             locationPermissionState.launchPermissionRequest()
         }
     }
 }
-
 
 @SuppressLint("MissingPermission")
 fun getLocation(
@@ -112,16 +143,46 @@ fun getLocation(
     onLocationReceived: (String) -> Unit
 ) {
     fusedLocationClient.lastLocation.addOnSuccessListener { location ->
-        location?.let {
+        if (location != null) {
             getCityName(context, location) { cityName ->
                 onLocationReceived(cityName)
             }
-        } ?: onLocationReceived("Location not found")
+        } else {
+            // Actively request location updates if lastLocation is null
+            requestCurrentLocation(fusedLocationClient, context, onLocationReceived)
+        }
     }.addOnFailureListener { exception ->
         Log.e("LocationError", "Error fetching location", exception)
-        onLocationReceived("Error fetching location")
     }
 }
+
+@SuppressLint("MissingPermission")
+fun requestCurrentLocation(
+    fusedLocationClient: FusedLocationProviderClient,
+    context: Context,
+    onLocationReceived: (String) -> Unit
+) {
+    val locationRequest = LocationRequest.Builder(
+        Priority.PRIORITY_HIGH_ACCURACY, 1000L
+    ).build()
+
+
+    fusedLocationClient.getCurrentLocation(
+        locationRequest.priority, null
+    ).addOnSuccessListener { location ->
+        if (location != null) {
+            getCityName(context, location) { cityName ->
+                onLocationReceived(cityName)
+            }
+        } else {
+            Log.e("LocationError", "Still unable to fetch location")
+        }
+    }.addOnFailureListener { exception ->
+        Log.e("LocationError", "Error actively requesting location", exception)
+    }
+}
+
+
 
 private fun getCityName(
     context: Context,
@@ -132,11 +193,7 @@ private fun getCityName(
         try {
             val geocoder = Geocoder(context, Locale.getDefault())
             val addresses = geocoder.getFromLocation(location.latitude, location.longitude, 1)
-            val cityName = if (!addresses.isNullOrEmpty()) {
-                addresses[0].locality ?: "City not found"
-            } else {
-                "City not found"
-            }
+            val cityName = addresses?.firstOrNull()?.locality ?: "City not found"
             withContext(Dispatchers.Main) {
                 onCityNameReceived(cityName)
             }
@@ -147,4 +204,17 @@ private fun getCityName(
             }
         }
     }
+}
+
+
+fun showEnableGPSDialog(context: Context) {
+    AlertDialog.Builder(context)
+        .setTitle("Enable GPS")
+        .setMessage("GPS is required for getting location. Please enable GPS in settings.")
+        .setPositiveButton("Settings") { _, _ ->
+            val intent = Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS)
+            context.startActivity(intent)
+        }
+        .setNegativeButton("Cancel", null)
+        .show()
 }
